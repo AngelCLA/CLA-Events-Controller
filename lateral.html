@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pantallas Laterales — ECS</title>
+  <style>
+    *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+    }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      cursor: none;
+    }
+
+    #screen-root {
+      position: fixed;
+      inset: 0;
+    }
+
+    /* ── Capas de contenido ── */
+    .layer {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 0.6s ease;
+      pointer-events: none;
+    }
+
+    .layer.hidden  { opacity: 0; }
+    .layer.visible { opacity: 1; }
+
+    /* Capas de slide (doble buffer = crossfade sin parpadeo) */
+    #layer-a, #layer-b {
+      background: #000;
+    }
+    /* Fondo difuminado — div real (no ::before) para poder setear background via JS */
+    .layer-blur {
+      position: absolute;
+      inset: -10%;
+      background-size: cover;
+      background-position: center;
+      filter: blur(40px) brightness(0.4);
+      z-index: 0;
+    }
+    #layer-a img, #layer-b img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      z-index: 1;
+    }
+
+    /* Pantalla negra */
+    #layer-black { background: #000; z-index: 20; }
+
+    /* Logo */
+    #layer-logo { background: #000; z-index: 15; }
+    #layer-logo img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+    #layer-logo .logo-text {
+      color: #fff;
+      font-family: 'Arial', sans-serif;
+      font-size: 5vw;
+      font-weight: 700;
+      text-align: center;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.6;
+    }
+
+    /* ── HUD de estado (visible unos segundos) ── */
+    #hud {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      padding: 10px 20px;
+      background: rgba(0,0,0,0.85);
+      border-top: 1px solid #f97316;
+      color: #f97316;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 13px;
+      z-index: 50;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      opacity: 0;
+      transition: opacity 0.4s ease;
+    }
+    #hud.show { opacity: 1; }
+
+    #slide-tag {
+      position: fixed;
+      bottom: 18px; right: 20px;
+      color: rgba(249,115,22,0.2);
+      font-family: 'Courier New', monospace;
+      font-size: 11px;
+      z-index: 45;
+    }
+
+    /* ── Indicador OFFLINE ── */
+    #offline-badge {
+      position: fixed;
+      top: 16px; right: 16px;
+      padding: 6px 14px;
+      background: rgba(239,68,68,0.9);
+      color: #fff;
+      font-family: monospace;
+      font-size: 12px;
+      border-radius: 4px;
+      z-index: 60;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    #offline-badge.show { opacity: 1; }
+  </style>
+</head>
+<body>
+
+<div id="screen-root">
+  <!-- Slide doble-buffer A -->
+  <div class="layer hidden" id="layer-a">
+    <div class="layer-blur" id="blur-a"></div>
+    <img id="img-a" src="" alt="">
+  </div>
+  <!-- Slide doble-buffer B -->
+  <div class="layer hidden" id="layer-b">
+    <div class="layer-blur" id="blur-b"></div>
+    <img id="img-b" src="" alt="">
+  </div>
+  <!-- Logo institucional -->
+  <div class="layer hidden" id="layer-logo">
+    <img src="assets/logo.png" alt="Logo" id="logo-img"
+         onerror="this.style.display='none'; document.getElementById('logo-fallback').style.display='flex';">
+    <div id="logo-fallback" style="display:none" class="logo-text">LOGO INSTITUCIONAL</div>
+  </div>
+  <!-- Pantalla negra -->
+  <div class="layer visible" id="layer-black"></div>
+</div>
+
+<!-- HUD -->
+<div id="hud">
+  <span id="hud-text">LATERALES · Iniciando…</span>
+  <span id="hud-clock"></span>
+</div>
+<div id="slide-tag" id="slide-tag">—/—</div>
+<div id="offline-badge">SIN SEÑAL</div>
+
+<!-- ─────────── Scripts ─────────── -->
+<script src="js/channel.js"></script>
+<script src="js/slideStorage.js"></script>
+<script>
+(async () => {
+  'use strict';
+
+  const channel = new EventChannel('lateral');
+  const storage = new SlideStorage();
+  await storage.ready;
+
+  // ─── Estado ───────────────────────────────────────────
+  const S = {
+    mode            : 'black',
+    presentationId  : null,
+    slideIndex      : 0,
+    totalSlides     : 0,
+    activeLayer     : 'a',      // doble buffer
+    autoplayTimer   : null,
+    autoplaySec     : 5,
+    lastHeartbeat   : Date.now(),
+  };
+
+  // ─── DOM ──────────────────────────────────────────────
+  const $ = id => document.getElementById(id);
+  const layers = {
+    a     : $('layer-a'),
+    b     : $('layer-b'),
+    logo  : $('layer-logo'),
+    black : $('layer-black'),
+  };
+  const imgs  = { a: $('img-a'),  b: $('img-b')  };
+  const blurs = { a: $('blur-a'), b: $('blur-b') };
+  const hud        = $('hud');
+  const hudText    = $('hud-text');
+  const hudClock   = $('hud-clock');
+  const slideTag   = $('slide-tag');
+  const offlineBadge = $('offline-badge');
+
+  // ─── Helpers ──────────────────────────────────────────
+  let hudTimer = null;
+  function showHUD(text, ms = 3000) {
+    // HUD desactivado para interfaz limpia
+    // hudText.textContent = text;
+    // hud.classList.add('show');
+    // clearTimeout(hudTimer);
+    // if (ms > 0) hudTimer = setTimeout(() => hud.classList.remove('show'), ms);
+  }
+
+  function setLayer(name, visible) {
+    layers[name].classList.toggle('visible', visible);
+    layers[name].classList.toggle('hidden',  !visible);
+  }
+
+  // ─── Cambiar modo ─────────────────────────────────────
+  function setMode(mode) {
+    S.mode = mode;
+    switch (mode) {
+      case 'black':
+        setLayer('black', true);
+        setLayer('logo',  false);
+        showHUD('● PANTALLA NEGRA');
+        break;
+      case 'logo':
+        setLayer('black', false);
+        setLayer('logo',  true);
+        showHUD('★ LOGO INSTITUCIONAL');
+        break;
+      case 'slide':
+        setLayer('black', false);
+        setLayer('logo',  false);
+        // las capas A/B se manejan en showSlide
+        break;
+    }
+    queuePreview();
+  }
+
+  // ─── Mostrar slide con crossfade ──────────────────────
+  async function showSlide(index) {
+    if (!S.presentationId) return;
+    const slide = await storage.getSlide(S.presentationId, index);
+    if (!slide) { showHUD(`⚠ Slide ${index + 1} no encontrado`); return; }
+
+    S.slideIndex = index;
+
+    const next    = S.activeLayer === 'a' ? 'b' : 'a';
+    const current = S.activeLayer;
+    const nextImg   = imgs[next];
+    const nextLayer = layers[next];
+    const nextBlur  = blurs[next];
+
+    // 1. Asegurar que la capa destino empiece invisible y sin transición
+    nextLayer.style.transition = 'none';
+    nextLayer.classList.remove('visible');
+    nextLayer.classList.add('hidden');
+
+    // 2. Cargar imagen y fondo difuminado en la capa oculta
+    nextBlur.style.backgroundImage  = `url(${slide.image})`;
+    nextImg.src = slide.image;
+
+    // 3. Esperar a que la imagen esté completamente decodificada
+    await new Promise(res => {
+      if (nextImg.complete && nextImg.naturalWidth > 0) { res(); return; }
+      nextImg.onload  = res;
+      nextImg.onerror = res;
+    });
+
+    // 4. Elevar z-index de la capa destino para que quede SOBRE la actual
+    //    (sin esto, layer-a nunca se ve cuando layer-b está encima en el DOM)
+    layers[current].style.zIndex = '1';
+    nextLayer.style.zIndex        = '2';
+
+    // 5. Restaurar transición y hacer fade-in de la capa destino
+    await new Promise(res => requestAnimationFrame(res));
+    nextLayer.style.transition = '';
+    setLayer(next,    true);
+    setLayer('black', false);
+    setLayer('logo',  false);
+
+    S.activeLayer = next;
+    S.mode = 'slide';
+
+    // 6. Tras el crossfade, ocultar la capa anterior y limpiar z-index
+    setTimeout(() => {
+      setLayer(current, false);
+      layers[current].style.zIndex = '';
+      nextLayer.style.zIndex       = '';
+    }, 650);
+
+    showHUD(`▶ Slide ${index + 1} / ${S.totalSlides}`, 2000);
+    setTimeout(queuePreview, 700);
+  }
+
+  // ─── Cargar presentación ──────────────────────────────
+  async function loadPresentation(id) {
+    const p = await storage.getPresentation(id);
+    if (!p) { showHUD(`⚠ Presentación no encontrada`); return; }
+    S.presentationId = id;
+    S.totalSlides    = p.totalSlides;
+    S.slideIndex     = 0;
+    showHUD(`📂 ${p.name} (${p.totalSlides} slides)`, 4000);
+  }
+
+  // ─── Preview hacia admin ───────────────────────────────
+  let previewRaf = null;
+  function queuePreview() {
+    cancelAnimationFrame(previewRaf);
+    previewRaf = requestAnimationFrame(sendPreview);
+  }
+
+  function sendPreview() {
+    const canvas = document.createElement('canvas');
+    canvas.width  = 320;
+    canvas.height = 180;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    
+    // Limpiar canvas
+    ctx.clearRect(0, 0, 320, 180);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, 320, 180);
+
+    if (S.mode === 'slide') {
+      const cur = imgs[S.activeLayer];
+      // Verificar que la imagen esté completamente cargada y lista
+      if (cur && cur.src && cur.complete && cur.naturalWidth > 0 && cur.naturalHeight > 0) {
+        try {
+          // Habilitar suavizado de alta calidad
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          
+          // Calcular dimensiones manteniendo aspect ratio
+          const scale = Math.min(320 / cur.naturalWidth, 180 / cur.naturalHeight);
+          const w = cur.naturalWidth * scale;
+          const h = cur.naturalHeight * scale;
+          const x = (320 - w) / 2;
+          const y = (180 - h) / 2;
+          
+          // Dibujar imagen centrada
+          ctx.drawImage(cur, x, y, w, h);
+        } catch (e) {
+          console.warn('Error dibujando slide:', e);
+        }
+      }
+    } else if (S.mode === 'logo') {
+      const li = $('logo-img');
+      if (li && li.complete && li.naturalWidth > 0 && li.naturalHeight > 0) {
+        try {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          const scale = Math.min(320 / li.naturalWidth, 180 / li.naturalHeight);
+          const w = li.naturalWidth * scale, h = li.naturalHeight * scale;
+          ctx.drawImage(li, (320 - w) / 2, (180 - h) / 2, w, h);
+        } catch (e) {
+          console.warn('Error dibujando logo:', e);
+        }
+      } else {
+        ctx.fillStyle = '#f97316';
+        ctx.font = 'bold 22px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('LOGO', 160, 98);
+      }
+    }
+    // mode=black → negro ya aplicado
+
+    channel.send(MSG.PREVIEW_UPDATE, {
+      screen     : 'lateral',
+      image      : canvas.toDataURL('image/jpeg', 0.65),
+      mode       : S.mode,
+      slideIndex : S.slideIndex,
+      totalSlides: S.totalSlides,
+    });
+  }
+
+  // ─── Autoplay ──────────────────────────────────────────
+  function startAutoplay(sec) {
+    stopAutoplay();
+    S.autoplaySec = sec || 5;
+    S.autoplayTimer = setInterval(() => {
+      if (S.mode === 'slide' && S.totalSlides > 0) {
+        showSlide((S.slideIndex + 1) % S.totalSlides);
+      }
+    }, S.autoplaySec * 1000);
+    showHUD(`▶▶ Autoplay cada ${S.autoplaySec}s`, 2500);
+  }
+  function stopAutoplay() {
+    clearInterval(S.autoplayTimer);
+    S.autoplayTimer = null;
+  }
+
+  // ─── Canal BroadcastChannel ───────────────────────────
+  channel.on(MSG.LATERAL_SLIDE, async payload => {
+    if (payload.presentationId && payload.presentationId !== S.presentationId)
+      await loadPresentation(payload.presentationId);
+    if (typeof payload.slideIndex === 'number')
+      await showSlide(payload.slideIndex);
+  });
+
+  channel.on(MSG.LATERAL_MODE, async payload => {
+    if (payload.presentationId && payload.presentationId !== S.presentationId)
+      await loadPresentation(payload.presentationId);
+    if (payload.mode === 'autoplay_start') startAutoplay(payload.seconds);
+    else if (payload.mode === 'autoplay_stop') stopAutoplay();
+    else setMode(payload.mode);
+  });
+
+  channel.on(MSG.PREVIEW_REQUEST, payload => {
+    if (!payload.screen || payload.screen === 'lateral') queuePreview();
+  });
+
+  channel.on(MSG.SCENE_EXECUTE, async payload => {
+    const c = payload.lateral;
+    if (!c) return;
+    if (c.presentationId && c.presentationId !== S.presentationId)
+      await loadPresentation(c.presentationId);
+    if (c.mode && c.mode !== 'slide') setMode(c.mode);
+    if (typeof c.slideIndex === 'number') await showSlide(c.slideIndex);
+  });
+
+  channel.on(MSG.AUTOPLAY_CONTROL, payload => {
+    if (payload.screen && payload.screen !== 'lateral') return;
+    payload.action === 'start' ? startAutoplay(payload.seconds) : stopAutoplay();
+  });
+
+  // ─── Reloj ────────────────────────────────────────────
+  setInterval(() => { hudClock.textContent = new Date().toLocaleTimeString('es-MX'); }, 1000);
+
+  // ─── Heartbeat ────────────────────────────────────────
+  channel.send(MSG.SCREEN_READY, { screen: 'lateral' });
+  setInterval(() => channel.send(MSG.SCREEN_HEARTBEAT, { screen:'lateral', mode:S.mode }), 4000);
+
+  // ─── Preview periódico ────────────────────────────────
+  setInterval(queuePreview, 4000);
+
+  // ─── Modo inicial ─────────────────────────────────────
+  setMode('black');
+  showHUD('● LATERALES — Sistema listo', 4000);
+
+  // ─── F o clic = fullscreen ────────────────────────────
+  document.addEventListener('keydown', e => {
+    if (e.key === 'f' || e.key === 'F') {
+      document.fullscreenElement
+        ? document.exitFullscreen()
+        : document.documentElement.requestFullscreen().catch(() => {});
+    }
+  });
+
+  console.log('[ECS] lateral.html lista — abrir admin.html para controlar');
+})();
+</script>
+</body>
+</html>
